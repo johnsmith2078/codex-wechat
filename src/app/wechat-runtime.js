@@ -7,6 +7,7 @@ const { CodexRpcClient } = require("../infra/codex/rpc-client");
 const codexMessageUtils = require("../infra/codex/message-utils");
 const { getUpdates, sendMessage, getConfig, sendTyping } = require("../infra/weixin/api");
 const { persistIncomingWeixinAttachments } = require("../infra/weixin/media-receive");
+const { getMimeFromFilename } = require("../infra/weixin/media-mime");
 const { sendWeixinMediaFile } = require("../infra/weixin/media-send");
 const { resolveSelectedAccount } = require("../infra/weixin/account-store");
 const {
@@ -572,6 +573,8 @@ class WechatRuntime {
       turnId,
     });
     await this.stopTypingForThread(threadId);
+
+
     await this.sendReplyToNormalized(normalized, "已发送停止请求。");
   }
 
@@ -1149,6 +1152,37 @@ class WechatRuntime {
     return candidatePath;
   }
 
+  async sendAssistantAttachmentsForReply({ userId, contextToken, workspaceRoot, replyText }) {
+    const filePaths = await extractAutoSendFilePathsFromReply(replyText, workspaceRoot);
+    const sent = [];
+    const failed = [];
+
+    for (const filePath of filePaths) {
+      try {
+        const outcome = await sendWeixinMediaFile({
+          filePath,
+          to: userId,
+          contextToken,
+          baseUrl: this.account.baseUrl,
+          token: this.account.token,
+          cdnBaseUrl: this.config.cdnBaseUrl,
+        });
+        sent.push({
+          filePath,
+          kind: outcome.kind,
+          fileName: outcome.fileName,
+        });
+      } catch (error) {
+        failed.push({
+          filePath,
+          reason: error instanceof Error ? error.message : String(error || "unknown upload error"),
+        });
+      }
+    }
+
+    return { sent, failed };
+  }
+
   async startTypingForThread(threadId, normalized) {
     if (!this.config.enableTyping || !threadId) {
       return;
@@ -1378,12 +1412,41 @@ class WechatRuntime {
     const runKey = this.currentRunKeyByThreadId.get(threadId) || codexMessageUtils.buildRunKey(threadId, turnId);
     const bufferedText = this.replyBufferByRunKey.get(runKey) || "";
     const context = this.pendingChatContextByThreadId.get(threadId);
+    const workspaceRoot = this.workspaceRootByThreadId.get(threadId) || "";
 
     if (outbound.payload.state === "streaming") {
       return;
     }
 
     await this.stopTypingForThread(threadId);
+
+    if (context && outbound.payload.state === "completed") {
+      const autoSent = await this.sendAssistantAttachmentsForReply({
+        userId: context.senderId,
+        contextToken: context.contextToken,
+        workspaceRoot,
+        replyText: bufferedText,
+      });
+      const hasPlainReplyText = !!markdownToPlainText(bufferedText);
+      if (hasPlainReplyText) {
+        await this.sendReplyToUser(context.senderId, bufferedText, context.contextToken);
+      } else if (!autoSent.sent.length) {
+        await this.sendReplyToUser(context.senderId, "å·²å®Œæˆã€‚", context.contextToken);
+      }
+
+      if (autoSent.failed.length) {
+        await this.sendReplyToUser(
+          context.senderId,
+          buildAutoSendFailureText(autoSent.failed),
+          context.contextToken
+        );
+      }
+
+      this.replyBufferByRunKey.delete(runKey);
+      this.activeTurnIdByThreadId.delete(threadId);
+      this.pendingApprovalByThreadId.delete(threadId);
+      return;
+    }
 
     if (context) {
       if (outbound.payload.state === "completed") {
@@ -1415,6 +1478,125 @@ function isNoRolloutFoundError(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildAutoSendFailureText(failed) {
+  const lines = ["è‡ªåŠ¨å‘é€é™„ä»¶å¤±è´¥:"];
+  for (const item of Array.isArray(failed) ? failed : []) {
+    const label = path.basename(item.filePath || "") || item.filePath || "(unknown file)";
+    lines.push(`- ${label}: ${item.reason || "upload failed"}`);
+  }
+  return lines.join("\n");
+}
+
+async function extractAutoSendFilePathsFromReply(replyText, workspaceRoot) {
+  const normalizedWorkspaceRoot = normalizeWorkspacePath(workspaceRoot);
+  if (!normalizedWorkspaceRoot) {
+    return [];
+  }
+
+  const candidates = collectAutoSendPathCandidates(replyText);
+  const resolved = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    const filePath = await resolveAutoSendFilePath(candidate, normalizedWorkspaceRoot);
+    if (!filePath) {
+      continue;
+    }
+    const normalized = normalizeWorkspacePath(filePath);
+    const dedupeKey = normalized.toLowerCase();
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    resolved.push(filePath);
+  }
+
+  return resolved;
+}
+
+function collectAutoSendPathCandidates(replyText) {
+  const text = String(replyText || "");
+  const candidates = [];
+  const pushCandidate = (value) => {
+    const normalized = normalizeTextValue(value);
+    if (normalized) {
+      candidates.push(normalized);
+    }
+  };
+
+  const markdownLinkPattern = /!?\[[^\]]*]\(([^)\n]+)\)/g;
+  let match = null;
+  while ((match = markdownLinkPattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
+  }
+
+  const backtickPathPattern = /`([^`\n]+)`/g;
+  while ((match = backtickPathPattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
+  }
+
+  return candidates;
+}
+
+async function resolveAutoSendFilePath(candidate, workspaceRoot) {
+  const normalizedCandidate = stripAutoSendCandidateDecorations(candidate);
+  if (!normalizedCandidate) {
+    return "";
+  }
+
+  const normalizedAbsoluteCandidate = normalizeWorkspacePath(normalizedCandidate);
+  const candidatePath = isAbsoluteWorkspacePath(normalizedCandidate)
+    ? path.resolve(normalizedAbsoluteCandidate)
+    : path.resolve(workspaceRoot, normalizedCandidate);
+  const normalizedPath = normalizeWorkspacePath(candidatePath);
+  if (!normalizedPath || !pathMatchesWorkspaceRoot(normalizedPath, workspaceRoot)) {
+    return "";
+  }
+
+  try {
+    const stats = await fs.promises.stat(candidatePath);
+    if (!stats.isFile()) {
+      return "";
+    }
+  } catch {
+    return "";
+  }
+
+  const mime = getMimeFromFilename(candidatePath);
+  if (!mime || mime === "application/octet-stream") {
+    return "";
+  }
+
+  return candidatePath;
+}
+
+function stripAutoSendCandidateDecorations(candidate) {
+  let value = normalizeTextValue(candidate);
+  if (!value) {
+    return "";
+  }
+
+  if (value.startsWith("<") && value.endsWith(">")) {
+    value = value.slice(1, -1).trim();
+  }
+
+  const hashIndex = value.indexOf("#L");
+  if (hashIndex >= 0) {
+    value = value.slice(0, hashIndex).trim();
+  }
+
+  const lineSuffixMatch = value.match(/^(.*\.[A-Za-z0-9_-]+):\d+(?::\d+)?$/);
+  if (lineSuffixMatch) {
+    value = lineSuffixMatch[1];
+  }
+
+  return value;
+}
+
+function normalizeTextValue(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function buildCodexInboundText(originalText, persisted) {
